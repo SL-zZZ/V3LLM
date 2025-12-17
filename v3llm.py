@@ -11,10 +11,8 @@ from .ivrllm import LlamaForCausalLM, LlamaDecoderLayer
 from transformers import LlamaTokenizer, LlamaConfig
 from models.position_embedding import PositionEmbeddingCoordsSine
 from peft import LoraConfig, get_peft_model
-# from models.load_llama import init_llama_model
 from torch.nn.utils.rnn import pad_sequence
 from collections import OrderedDict
-from .chat_3d_cross_attention import nclamp, print_grad_status
 import contextlib
 from dataset.base_dataset import update_caption, recover_caption
 
