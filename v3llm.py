@@ -1,13 +1,11 @@
 import random
 import logging
-from abc import ABC
 
 import torch
 from torch.cuda.amp import autocast as autocast
 import torch.nn as nn
 import torch.nn.functional as F
-
-from .ivrllm import LlamaForCausalLM, LlamaDecoderLayer
+from .ivrllm import LlamaForCausalLM, LlamaDecoderCrossLayer
 from transformers import LlamaTokenizer, LlamaConfig
 from models.position_embedding import PositionEmbeddingCoordsSine
 from peft import LoraConfig, get_peft_model
@@ -15,6 +13,8 @@ from torch.nn.utils.rnn import pad_sequence
 from collections import OrderedDict
 import contextlib
 from dataset.base_dataset import update_caption, recover_caption
+from sentence_transformers import SentenceTransformer, util
+
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,7 @@ class V3LLM(nn.Module):
         self.feat_fusion = config.model.feat_fusion
         self.fuse_with_id = config.model.fuse_with_id
         self.use_location_token = config.model.use_location_token
+        self.sim_model = SentenceTransformer()
 
         self.debug = config.debug
         if not self.debug:
@@ -55,7 +56,7 @@ class V3LLM(nn.Module):
                     torch_dtype=torch.bfloat16,
                     attn_implementation="eager"
                 )
-            self.initialize_llm_decoder()
+            self.initialize_llm_cross_attn()
 
             logger.info("freeze LLAMA")
             for name, param in self.llama_model.named_parameters():
@@ -77,7 +78,7 @@ class V3LLM(nn.Module):
                                     ]
                                 ]
                             )
-                            and any([(x in name)for x in lora_target_modules])
+                            and any([(x in name and "cross_attn_gate_proj" not in name)for x in lora_target_modules])
                         ):
                             lora_module_names.add(name)
                     return sorted(list(lora_module_names))
@@ -100,7 +101,7 @@ class V3LLM(nn.Module):
                 self.llama_model.model.model.embed_tokens.weight.data = self.llama_model.model.model.embed_tokens.weight.data.float()
                 self.llama_model.print_trainable_parameters()
                 for name, param in self.llama_model.model.named_parameters():
-                    if "last_k_fuse" in name or "last_v_fuse" in name:
+                    if "vh_fuse" in name or "vh_self_fuse" in name:
                         param.requires_grad = True
             else:
                 self.llama_model.lm_head.weight.requires_grad = True
@@ -143,7 +144,17 @@ class V3LLM(nn.Module):
         if not self.train_img_proj:
             for p in self.object_img_proj.parameters():
                 p.requires_grad = False
-    
+
+        self.mlp_multi_embed = nn.Sequential(
+            nn.Linear(self.img_input_dim+self.input_dim, self.llama_dim),
+            nn.GELU(),
+            nn.Linear(self.llama_dim, self.llama_dim)
+        )
+        self.mlp_proj_locs=nn.Sequential(
+            nn.Linear(6, self.llama_dim),
+            nn.GELU(),
+            nn.Linear(self.llama_dim, self.llama_dim)
+        )
         self.pos_embedding = PositionEmbeddingCoordsSine(d_pos=self.pos_dim)
         self.pos_proj = nn.Sequential(
             nn.Linear(self.pos_dim, self.llama_dim)
@@ -158,26 +169,47 @@ class V3LLM(nn.Module):
             self.p_0_embed, self.p_1_embed = self.prepare_fixed_embed()
         self.last_embed = None
 
-    def initialize_llm_decoder(self):
+    def initialize_llm_cross_attn(self):
         for i, layer in enumerate(self.llama_model.model.layers):
-            if hasattr(layer.self_attn,"last_k_proj"):
-                k_weight = layer.self_attn.k_proj.weight
-                new_state_dict = OrderedDict()
-                new_state_dict['weight'] = k_weight
-                layer.self_attn.last_k_proj.load_state_dict(new_state_dict)
-            if hasattr(layer.self_attn,"last_v_proj"):
-                k_weight = layer.self_attn.v_proj.weight
-                new_state_dict = OrderedDict()
-                new_state_dict['weight'] = k_weight
-                layer.self_attn.last_v_proj.load_state_dict(new_state_dict)
-            
-            if hasattr(layer.self_attn,"last_k_fuse"):
-                nn.init.constant_(layer.self_attn.last_k_fuse.weight, 0)
+            if i >= 24:
+                layer_config = layer.config
+                layer_config._attn_implementation = self.config.model.cross_attn_implementation
+                cross_decoder_layer = LlamaDecoderCrossLayer(config=layer_config, layer_idx=i)
+                _, unexpected_keys = cross_decoder_layer.load_state_dict(layer.state_dict(), strict=False) 
+                
+                if hasattr(cross_decoder_layer.self_attn, "threshold"):
+                    cross_decoder_layer.self_attn.threshold = self.config.model.cross_attn_implementation_threshold
 
-            if hasattr(layer.self_attn,"last_v_fuse"):
-                nn.init.constant_(layer.self_attn.last_v_fuse.weight, 0)
-            
-            self.llama_model.model.layers[i] = layer
+                if hasattr(cross_decoder_layer.self_attn,"vh_k_proj"):
+                    k_weight = layer.self_attn.k_proj.weight
+                    new_state_dict = OrderedDict()
+                    new_state_dict['weight'] = k_weight
+                    cross_decoder_layer.self_attn.vh_k_proj.load_state_dict(new_state_dict)
+                
+                if hasattr(cross_decoder_layer.self_attn,"vh_q_proj"):
+                    q_weight = layer.self_attn.q_proj.weight
+                    new_state_dict = OrderedDict()
+                    new_state_dict['weight'] = q_weight
+                    cross_decoder_layer.self_attn.vh_q_proj.load_state_dict(new_state_dict)
+
+                if hasattr(cross_decoder_layer.self_attn,"vh_v_proj"):
+                    v_weight = layer.self_attn.v_proj.weight
+                    new_state_dict = OrderedDict()
+                    new_state_dict['weight'] = v_weight
+                    cross_decoder_layer.self_attn.vh_v_proj.load_state_dict(new_state_dict)
+
+                if hasattr(cross_decoder_layer.self_attn,"vh_fuse"):
+                    nn.init.constant_(cross_decoder_layer.self_attn.vh_fuse.weight, 0)
+
+                if hasattr(cross_decoder_layer.self_attn,"vh_multi_fuse"):
+                    nn.init.normal_(cross_decoder_layer.self_attn.vh_multi_fuse.weight, mean=0.0, std=0.02)
+
+
+                if hasattr(cross_decoder_layer.self_attn,"vh_self_fuse"):
+                    nn.init.constant_(cross_decoder_layer.self_attn.vh_self_fuse.weight, 0)
+                self.llama_model.model.layers[i] = cross_decoder_layer
+
+
     
     def get_objid_embeds(self):
         if self.config.model.use_lora:
@@ -237,12 +269,13 @@ class V3LLM(nn.Module):
             objid_embeds = objid_embeds.detach()
         selected_objid_embeds = objid_embeds[valid_ids]
 
-        if embed_img is not None and embed_scene is None:
-            object_list_embed = torch.zeros((selected_objid_embeds.shape[0] * 3, selected_objid_embeds.shape[1]), dtype=selected_objid_embeds.dtype, device=selected_objid_embeds.device)
-            object_list_embed[0::3, :] = selected_objid_embeds
-            object_list_embed[1::3, :] = embed_obj[assigned_ids]
-            object_list_embed[2::3, :] = embed_img[assigned_ids]
-            return object_list_embed
+        object_list_embed = torch.zeros((selected_objid_embeds.shape[0] * 3, selected_objid_embeds.shape[1]), dtype=selected_objid_embeds.dtype, device=selected_objid_embeds.device)
+        object_list_embed[0::3, :] = selected_objid_embeds
+        object_list_embed[1::3, :] = embed_obj[assigned_ids]
+        object_list_embed[2::3, :] = embed_img[assigned_ids]
+        return object_list_embed
+        
+
 
     def get_min_max_coord(self, xyz, scene_mask):
         scene_mask = scene_mask.unsqueeze(-1).expand_as(xyz)
@@ -252,12 +285,25 @@ class V3LLM(nn.Module):
         maxs = masked_xyz_max.max(dim=1)[0]
         return mins, maxs
 
-    def forward_train(self, scene_feat, scene_img_feat, scene_locs, scene_mask, obj_ids, assigned_ids, questions, answers, is_eval=False, **kwargs):
+    def forward_train(self, scene_feat, scene_img_feat, scene_locs, scene_mask, obj_ids, assigned_ids, questions, answers, qa_types, is_eval=False, **kwargs):
         object_embed, object_img_embed = self.encode_object_feat(scene_feat, scene_img_feat, scene_locs)
         device = object_embed.device
         batch_size = object_embed.shape[0]
         proj_object_embed = self.object_proj(object_embed)
         proj_object_img_embed = self.object_img_proj(object_img_embed)
+
+        ##self.robin_cat
+        multi_embed = torch.cat([object_embed, object_img_embed], dim=-1)
+        multi_embed = self.mlp_multi_embed(multi_embed)
+        proj_locs = self.mlp_proj_locs(scene_locs)
+        multi_embed = multi_embed + proj_locs
+
+        assigned_multi_embed = []
+        for i in range(batch_size):
+            assigned_multi_embed.append(multi_embed[i][assigned_ids[i]])
+        multi_embed = torch.stack(assigned_multi_embed)
+
+        self.assign_visual_hidden_states_to_llm(multi_embed)
 
         proj_scene_embed = None
         input_embed_list, attn_list, target_list = [], [], []
@@ -265,6 +311,7 @@ class V3LLM(nn.Module):
         p_0_embed = self.p_0_embed.to(device) #45
         p_1_embed = self.p_1_embed.to(device) #6
         for i, question in enumerate(questions):
+            
             prompt = f"{question} {self.role[1]}: "
             prompt_embed = self.get_text_emb(prompt, device=device).squeeze(0)
             object_list_embed = self.get_object_list_embed(
@@ -284,8 +331,9 @@ class V3LLM(nn.Module):
             answer = answers[i] + self.end_sym
             to_regress_token = self.llama_tokenizer(answer, return_tensors="pt", add_special_tokens=False).to(device)
             answer_target = to_regress_token.input_ids.masked_fill(
-                to_regress_token.input_ids == self.llama_tokenizer.pad_token_id, -100
-            ).squeeze(0)
+                    to_regress_token.input_ids == self.llama_tokenizer.pad_token_id, -100
+                ).squeeze(0)
+            
             to_regress_embed = self.get_text_emb(answer, device=device).squeeze(0)
 
             target = torch.cat([empty_target, answer_target], dim=0)
@@ -314,9 +362,32 @@ class V3LLM(nn.Module):
                 return_dict=True,
                 labels=targets,
             )
+        output_logits = outputs[1]
+        output_texts = []
+        for i in range(targets.shape[0]):
+            idx = (targets[i][1:]!=-100).nonzero().squeeze(-1)
+            token_ids = output_logits[i][:-1][idx]
+            token_ids = torch.argmax(token_ids, dim=-1)
+            output_text = self.llama_tokenizer.decode(token_ids)
+            output_text = output_text.split(self.end_sym)[0]
+            output_texts.append(output_text)
+        with torch.no_grad():
+            embed1 = self.sim_model.encode(output_texts, convert_to_tensor=True,show_progress_bar=False)
+            embed2 = self.sim_model.encode(answers, convert_to_tensor=True,show_progress_bar=False)
+            similarities = util.cos_sim(embed1, embed2).diagonal()        
+
+        log_probs = -torch.nn.functional.cross_entropy(
+            output_logits[..., :-1, :].reshape(-1, output_logits.size(-1)),
+            targets[..., 1:].reshape(-1),
+            ignore_index=-100,
+            reduction="none",
+        ).reshape(output_logits.shape[0], -1)
+        obj = log_probs * similarities[:, None].to(device)
+        obj = obj[targets[..., 1:]!=-100].mean()
+
 
         return dict(
-            loss=outputs.loss,
+            loss = -obj,
             obj_norm=proj_object_embed.norm(dim=-1).mean().detach().cpu(),
             obj_img_norm=proj_object_img_embed.norm(dim=-1).mean().detach().cpu(),
             objid_norm=self.get_objid_embeds().norm(dim=-1).mean().detach().cpu(),
@@ -328,23 +399,26 @@ class V3LLM(nn.Module):
    
     def evaluate(self, scene_feat, scene_img_feat, scene_locs, scene_mask, custom_prompt, obj_ids, assigned_ids, is_eval=True, **kwargs):
         object_embed, object_img_embed = self.encode_object_feat(scene_feat, scene_img_feat, scene_locs)
+        
         device = object_embed.device
         batch_size, obj_num = object_embed.shape[:2]
         proj_object_embed = self.object_proj(object_embed)
         proj_object_img_embed = self.object_img_proj(object_img_embed)
 
-        ##self.robin_cat
-        # multi_embed = torch.cat([object_embed, object_img_embed], dim=-1)
-        # multi_embed = self.mlp_multi_embed(multi_embed)
-        # proj_locs = self.mlp_proj_locs(scene_locs)
-        # multi_embed = multi_embed + proj_locs
+        multi_embed = torch.cat([object_embed, object_img_embed], dim=-1)
+        multi_embed = self.mlp_multi_embed(multi_embed)
+        proj_locs = self.mlp_proj_locs(scene_locs)
+        multi_embed = multi_embed + proj_locs
 
         output_texts = []
         p_0_embed = self.p_0_embed.to(device).unsqueeze(0)
         p_1_embed = self.p_1_embed.to(device).unsqueeze(0)
 
         for i in range(batch_size):
-            tmp_prompt = f" {custom_prompt[i]} {self.role[1]}: "
+            if self.config.qa_tokens:
+                tmp_prompt = f"<Question> {custom_prompt[i]} {self.role[1]}: <Answer> "
+            else:
+                tmp_prompt = f" {custom_prompt[i]} {self.role[1]}: "
             tmp_prompt = update_caption(tmp_prompt, assigned_ids[i])
             prompt_embed = self.get_text_emb(tmp_prompt, device=device)
             object_list_embed = self.get_object_list_embed(
@@ -356,7 +430,8 @@ class V3LLM(nn.Module):
                 assigned_ids[i]
             )
             object_list_embed = object_list_embed.unsqueeze(0)
-            
+            multi_embed_assigned = multi_embed[i][assigned_ids[i]].unsqueeze(0)
+            self.assign_visual_hidden_states_to_llm(multi_embed_assigned)
             wrapped_embed = torch.cat([p_0_embed, object_list_embed, p_1_embed, prompt_embed], dim=1)
             attention_mask=None
             
